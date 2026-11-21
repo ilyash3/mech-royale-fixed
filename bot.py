@@ -5,6 +5,11 @@ import math
 import random
 import mechfight as mf
 
+try:
+    import nav
+except Exception:  # keep the bot running even if nav.py is missing
+    nav = None
+
 TAU = math.tau
 PICK_PRIORITY = ["plating", "armor", "nanites", "gun_damage", "gun_rate", "laser_damage", "laser_charge",
                  "servos", "gun_mag", "lightning_efficiency", "lightning_chain", "gyros", "reactor",
@@ -53,10 +58,11 @@ HUNT = False           # when healthy, walk toward visible mechs (up to 230 m) a
 HUNT_HP = 0.7          # only hunt above this HP fraction
 NPC_FARM = True       # early on, go to drones (2 cubes each) and shoot crates (1 cube, maybe a weapon)
 NPC_FARM_UNTIL = 120.0  # seconds of match time to farm
-FLEE_COUNT = 3         # retreat when this many mechs are within 100 m
+FLEE_COUNT = 2         # retreat when this many mechs are within 100 m
 FIGHT_RANGE = 70.0     # preferred distance to the target with a laser or gun
 STYLE = "default"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far),
                        # "adaptive" (range and loot chosen from our and the enemy's weapons)
+NAV = True             # plan routes around buildings (A* on a 4 m grid) for zone, loot, drops, hunting
 LASER_DODGE = True    # sidestep when a visible enemy is charging a laser aimed at us
 UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
@@ -143,6 +149,12 @@ class Bot:
         self.cfg = cfg
         self.rng = random.Random(hello.get("seed", 1))
         self.world = World(hello["map"]["dir"])
+        self.nav = None
+        if NAV and nav is not None:
+            try:
+                self.nav = nav.Navigator(nav.NavGrid(hello["map"]["dir"]))
+            except Exception as e:
+                mf.log("nav build failed", e)
         self.strafe = 1
         self.strafe_until = 0
         self.last_dir = None
@@ -458,6 +470,7 @@ class Bot:
         mx, my = 0.0, 0.0
         boost = False
         mode = "idle"
+        nav_goal = None  # long-range destination for route planning
 
         def toward(px, py, w=1.0):
             a = math.atan2(py - y, px - x)
@@ -471,6 +484,7 @@ class Bot:
 
         if outside:
             mode = "zone"
+            nav_goal = zc
             tx_, ty_ = toward(zc[0], zc[1])
             mx, my = tx_, ty_
             boost = me["energy"] > 15
@@ -631,12 +645,23 @@ class Bot:
                     goal = [cx_, cy_]
                     mode = "zone-move"
             if goal is not None:
+                nav_goal = goal
                 mx, my = toward(goal[0], goal[1])
                 dgoal = math.hypot(goal[0] - x, goal[1] - y)
                 if dgoal < 3.5 and mode in ("loot", "cube"):
                     mx, my = mx * 0.2, my * 0.2
             elif mode == "idle":
                 mx = my = 0.0
+
+        # route planning: replace the straight-line heading with the next step of an A* route
+        if NAV and self.nav is not None and nav_goal is not None and (mx or my):
+            dgoal = math.hypot(nav_goal[0] - x, nav_goal[1] - y)
+            on_ground = z - self.nav.G.ground(x, y) < 3.0  # skip on roofs
+            if dgoal > 10 and on_ground:
+                hd = self.nav.heading(x, y, nav_goal[0], nav_goal[1], t, budget=1000)
+                if hd is not None:
+                    n = max(0.2, min(1.0, math.hypot(mx, my)))
+                    mx, my = math.cos(hd) * n, math.sin(hd) * n
 
         # dodge incoming enemy projectiles
         for pr in obs["projectiles"]:
