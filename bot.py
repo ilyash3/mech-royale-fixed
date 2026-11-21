@@ -12,18 +12,29 @@ PICK_PRIORITY = ["plating", "armor", "nanites", "gun_damage", "gun_rate", "laser
                  "lightning_range", "laser_pierce", "mortar_velocity"]
 # Mortar is never taken: holding one makes enemy laser hits do +60% (cook-off).
 WEAPON_RANK = {"laser": 3, "lightning": 2}
+BRAWLER_RANK = {"lightning": 3, "laser": 2}
+OFFENSE_PRIORITY = ["laser_charge", "laser_damage", "lightning_efficiency", "lightning_chain", "gun_rate",
+                    "gun_damage", "plating", "armor", "gyros", "nanites", "lightning_range", "gun_mag",
+                    "gun_velocity", "servos", "reactor", "capacitor", "laser_pierce", "sensors", "jets",
+                    "mortar_reload", "mortar_splash", "mortar_velocity"]
+
+
+def wrank():
+    return BRAWLER_RANK if STYLE == "brawler" else WEAPON_RANK
 
 # Feature switches (set to False to turn a behavior off).
 PEEK_FIGHT = False     # duck behind cover while the laser cools down, charge there, peek out to fire
 EARLY_LOOT = True      # remember seen weapons; go far for a laser/lightning in the first 100 s
 LETHAL_RELEASE = True  # fire a partly charged laser when it already kills the target
 DROPS_ANY_HP = True    # go for uncontested supply drops from farther away, before loot and cubes
-HUNT = True           # when healthy, walk toward visible mechs (up to 230 m) and recent nearby gunfire
+HUNT = False           # when healthy, walk toward visible mechs (up to 230 m) and recent nearby gunfire
 HUNT_HP = 0.7          # only hunt above this HP fraction
 NPC_FARM = True       # early on, go to drones (2 cubes each) and shoot crates (1 cube, maybe a weapon)
 NPC_FARM_UNTIL = 120.0  # seconds of match time to farm
 FLEE_COUNT = 3         # retreat when this many mechs are within 100 m
 FIGHT_RANGE = 70.0     # preferred distance to the target with a laser or gun
+STYLE = "brawler"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far)
+UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
 
 def wrap(a):
@@ -233,7 +244,8 @@ class Bot:
         # offer
         if obs["offer"]:
             ids = [c["id"] for c in obs["offer"]["choices"]]
-            pick = min(range(len(ids)), key=lambda i: PICK_PRIORITY.index(ids[i]) if ids[i] in PICK_PRIORITY else 99)
+            prio = OFFENSE_PRIORITY if UPGRADES == "offense" else PICK_PRIORITY
+            pick = min(range(len(ids)), key=lambda i: prio.index(ids[i]) if ids[i] in prio else 99)
             act["pick"] = pick
 
         for ev in obs.get("events", []):
@@ -288,8 +300,9 @@ class Bot:
         # pickups
         reach = self.cfg["loot"]["pickup_radius"] - 0.6
         near_pick = [p for p in obs["pickups"] if math.hypot(p["pos"][0] - x, p["pos"][1] - y) < reach and abs(p["pos"][2] - z) < 3.5]
-        for p in sorted(near_pick, key=lambda p: -WEAPON_RANK.get(p["kind"], 0)):
-            if p["kind"] not in WEAPON_RANK or p["kind"] in wk:
+        rank = wrank()
+        for p in sorted(near_pick, key=lambda p: -rank.get(p["kind"], 0)):
+            if p["kind"] not in rank or p["kind"] in wk:
                 continue
             if wk[1] is None:
                 act["take"] = p["id"]
@@ -297,8 +310,13 @@ class Bot:
             if wk[0] is None:
                 act["take"] = p["id"]
                 break
-            have = WEAPON_RANK.get(wk[1], 0)
-            if wk[1] and WEAPON_RANK.get(p["kind"], 0) > have:
+            if STYLE == "brawler" and "gun" in wk:
+                # Brawler: swap the gun out for laser/lightning.
+                act["take"] = p["id"]
+                act["drop"] = wk.index("gun")
+                break
+            have = rank.get(wk[1], 0)
+            if wk[1] and rank.get(p["kind"], 0) > have:
                 act["take"] = p["id"]
                 act["drop"] = 1
                 break
@@ -425,7 +443,7 @@ class Bot:
             tx_, ty_ = toward(zc[0], zc[1])
             mx, my = tx_, ty_
             boost = me["energy"] > 15
-        elif target is not None and tgt_d is not None and tgt_d < 140:
+        elif target is not None and tgt_d is not None and tgt_d < (220 if STYLE == "sniper" else 140):
             mode = "fight"
             ex, ey = target["pos"][0] - x, target["pos"][1] - y
             ed = math.hypot(ex, ey) + 1e-6
@@ -441,6 +459,10 @@ class Bot:
                 desired = 25.0  # close in on drones/crates so their cubes are in reach
             if slot("lightning") is not None and slot("laser") is None:
                 desired = 28.0
+            if STYLE == "brawler" and slot("lightning") is not None and target["kind"] == "mech":
+                desired = 26.0
+            if STYLE == "sniper" and target["kind"] == "mech":
+                desired = 160.0
             radial = max(-1.0, min(1.0, (ed - desired) / 40.0))
             if flee:
                 mode = "flee"
@@ -454,6 +476,9 @@ class Bot:
                 zx, zy = toward(zc[0], zc[1], edge_pressure * 1.5)
                 mx += zx
                 my += zy
+                if (STYLE == "brawler" and target["kind"] == "mech" and slot("lightning") is not None
+                        and ed > 45 and me["energy"] > 50 and hp_frac > 0.5):
+                    boost = True  # close the gap into lightning range quickly
                 # Peek fighting against a lone mech: hide while the laser cools down and charges,
                 # then step out with a full charge and fire. Not at lightning range (brawl there).
                 lightning_brawl = slot("lightning") is not None and ed < 42
@@ -513,12 +538,13 @@ class Bot:
                     pk = [{"kind": k, "pos": pp} for k, pp in self.seen_pickups.values()]
                 else:
                     pk = obs["pickups"]
-                pk = [p for p in pk if p["kind"] in WEAPON_RANK and p["kind"] not in wk
+                pk = [p for p in pk if p["kind"] in rank and p["kind"] not in wk
                       and math.hypot(p["pos"][0] - zc[0], p["pos"][1] - zc[1]) < zr - 15]
                 # Early on, with no laser or lightning yet, a far weapon is worth the walk.
-                unarmed = not any(k in WEAPON_RANK for k in wk)
+                unarmed = not any(k in rank for k in wk)
                 loot_range = 250 if (EARLY_LOOT and unarmed and t < 100) else 90
-                if pk and (wk[1] is None or wk[0] is None) and not self.recover:
+                want_slot = wk[1] is None or wk[0] is None or (STYLE == "brawler" and "gun" in wk)
+                if pk and want_slot and not self.recover:
                     p = min(pk, key=lambda p: d2(p["pos"]))
                     if d2(p["pos"]) < loot_range:
                         goal = p["pos"]
