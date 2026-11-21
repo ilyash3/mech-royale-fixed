@@ -18,6 +18,12 @@ PEEK_FIGHT = False     # duck behind cover while the laser cools down, charge th
 EARLY_LOOT = True      # remember seen weapons; go far for a laser/lightning in the first 100 s
 LETHAL_RELEASE = True  # fire a partly charged laser when it already kills the target
 DROPS_ANY_HP = True    # go for uncontested supply drops from farther away, before loot and cubes
+HUNT = True           # when healthy, walk toward visible mechs (up to 230 m) and recent nearby gunfire
+HUNT_HP = 0.7          # only hunt above this HP fraction
+NPC_FARM = False       # early on, go to drones (2 cubes each) and shoot crates (1 cube, maybe a weapon)
+NPC_FARM_UNTIL = 120.0  # seconds of match time to farm
+FLEE_COUNT = 3         # retreat when this many mechs are within 100 m
+FIGHT_RANGE = 70.0     # preferred distance to the target with a laser or gun
 
 
 def wrap(a):
@@ -307,6 +313,12 @@ class Bot:
             n0 = min(npcs, key=lambda m: d2(m["pos"]))
             if d2(n0["pos"]) < 70:
                 target = n0
+        if NPC_FARM and target is None and hp_frac > 0.6 and obs["t"] < NPC_FARM_UNTIL:
+            # Shoot a nearby crate: treat it as a still, low target.
+            crs = [c for c in obs["crates"] if d2(c["pos"]) < 60 and self.world.los(x, y, c["pos"][0], c["pos"][1], z)]
+            if crs:
+                c0 = min(crs, key=lambda c: d2(c["pos"]))
+                target = {"id": c0["id"], "kind": "crate", "pos": c0["pos"], "vel": [0.0, 0.0, 0.0], "hp": c0["hp"]}
         tgt_d = None
         visible_los = False
         laser_cd = None       # laser cooldown left, if we hold a laser
@@ -419,12 +431,14 @@ class Bot:
             ed = math.hypot(ex, ey) + 1e-6
             rx, ry = ex / ed, ey / ed
             n_threat = len([m for m in close if d2(m["pos"]) < 100])
-            flee = (self.recover and ed > 12) or n_threat >= 3
+            flee = (self.recover and ed > 12) or n_threat >= FLEE_COUNT
             if t > self.strafe_until:
                 self.strafe = -self.strafe if self.rng.random() < 0.6 else self.strafe
                 self.strafe_until = t + self.rng.uniform(0.7, 1.8)
             px_, py_ = -ry * self.strafe, rx * self.strafe
-            desired = 70.0
+            desired = FIGHT_RANGE
+            if NPC_FARM and target["kind"] != "mech":
+                desired = 25.0  # close in on drones/crates so their cubes are in reach
             if slot("lightning") is not None and slot("laser") is None:
                 desired = 28.0
             radial = max(-1.0, min(1.0, (ed - desired) / 40.0))
@@ -510,10 +524,29 @@ class Bot:
                         goal = p["pos"]
                         mode = "loot"
             if goal is None and mode != "hold-drop":
-                cu = [c for c in obs["cubes"] if d2(c["pos"]) < 45 and math.hypot(c["pos"][0] - zc[0], c["pos"][1] - zc[1]) < zr - 12]
+                cube_r = 80 if NPC_FARM else 45
+                cu = [c for c in obs["cubes"] if d2(c["pos"]) < cube_r and math.hypot(c["pos"][0] - zc[0], c["pos"][1] - zc[1]) < zr - 12]
                 if cu and not self.recover:
                     goal = min(cu, key=lambda c: d2(c["pos"]))["pos"]
                     mode = "cube"
+            if goal is None and mode != "hold-drop" and not self.recover:
+                in_zone_pt = lambda p: math.hypot(p[0] - zc[0], p[1] - zc[1]) < zr - 15
+                if NPC_FARM and t < NPC_FARM_UNTIL and hp_frac > 0.6:
+                    far_npcs = [n for n in npcs if d2(n["pos"]) < 200 and in_zone_pt(n["pos"])]
+                    if far_npcs:
+                        goal = min(far_npcs, key=lambda n: d2(n["pos"]))["pos"]
+                        mode = "farm"
+                if goal is None and HUNT and hp_frac > HUNT_HP:
+                    prey = [m for m in mechs if d2(m["pos"]) < 230 and in_zone_pt(m["pos"])]
+                    if prey:
+                        goal = prey[0]["pos"]  # nearest (low-HP mechs sort first)
+                        mode = "hunt"
+                    elif self.sound_bearing is not None and t - self.sound_t < 3:
+                        sb = self.sound_bearing
+                        cand = [x + math.cos(sb) * 40, y + math.sin(sb) * 40]
+                        if in_zone_pt(cand):
+                            goal = cand
+                            mode = "hunt-sound"
             if goal is None and not DROPS_ANY_HP:  # original drop logic, used when the switch is off
                 for dr in obs["drops"]:
                     dd = d2(dr["pos"])
