@@ -64,6 +64,7 @@ STYLE = "default"      # "default", "brawler" (lightning + laser, drop the gun, 
                        # "adaptive" (range and loot chosen from our and the enemy's weapons)
 NAV = True             # plan routes around buildings (A* on a 4 m grid) for zone, loot, drops, hunting
 LASER_DODGE = True    # sidestep when a visible enemy is charging a laser aimed at us
+LASER_COVER = True    # instead of sidestepping, run behind the nearest wall (within 16 m) to break its line of sight
 UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
 
@@ -693,6 +694,15 @@ class Bot:
                     continue
                 lateral = dd * math.sin(err)  # signed miss distance of their current aim line
                 if abs(lateral) < my_r + 4.0:
+                    if LASER_COVER:
+                        if not self.world.los(x, y, sx_, sy_, z):
+                            break  # already behind a wall from it
+                        cov = self.find_cover(x, y, z, sx_, sy_, m["id"], t, zc, zr)
+                        if cov is not None and math.hypot(cov[0] - x, cov[1] - y) < 16:
+                            mx, my = toward(cov[0], cov[1])
+                            boost = me["energy"] > 12
+                            mode = "laser-cover"
+                            break
                     ux, uy = (x - sx_) / dd, (y - sy_) / dd   # along their aim, toward us
                     side = 1.0 if lateral >= 0 else -1.0       # step to the side we are already on
                     px2, py2 = -uy * side, ux * side
