@@ -14,7 +14,7 @@ PICK_PRIORITY = ["plating", "armor", "nanites", "gun_damage", "gun_rate", "laser
 WEAPON_RANK = {"laser": 3, "lightning": 2}
 
 # Feature switches (set to False to turn a behavior off).
-PEEK_FIGHT = True      # duck behind cover while the laser cools down, charge there, peek out to fire
+PEEK_FIGHT = False     # duck behind cover while the laser cools down, charge there, peek out to fire
 EARLY_LOOT = True      # remember seen weapons; go far for a laser/lightning in the first 100 s
 LETHAL_RELEASE = True  # fire a partly charged laser when it already kills the target
 DROPS_ANY_HP = True    # go for uncontested supply drops from farther away, before loot and cubes
