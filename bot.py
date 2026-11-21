@@ -19,8 +19,30 @@ OFFENSE_PRIORITY = ["laser_charge", "laser_damage", "lightning_efficiency", "lig
                     "mortar_reload", "mortar_splash", "mortar_velocity"]
 
 
-def wrank():
-    return BRAWLER_RANK if STYLE == "brawler" else WEAPON_RANK
+def wrank(enemy_seen=None):
+    if STYLE == "brawler":
+        return BRAWLER_RANK
+    if STYLE == "adaptive" and enemy_seen:
+        # Counter what the field carries: lightning beats laser, laser beats mortar.
+        tot = sum(v for k, v in enemy_seen.items() if k != "gun")  # everyone has a gun
+        if tot < 2:
+            return dict(WEAPON_RANK)
+        laser_share = enemy_seen.get("laser", 0) / tot
+        return {"lightning": 3.5, "laser": 3} if laser_share > 0.45 else dict(WEAPON_RANK)
+    return WEAPON_RANK
+
+
+def matchup_range(ours, theirs, default):
+    """Preferred distance against one enemy, from the weapon triangle. Returns (range, close_fast)."""
+    if "lightning" in ours and "laser" in theirs and "lightning" not in theirs:
+        return 26.0, True    # get inside arc range: every hit shorts their laser
+    if "lightning" in theirs and "lightning" not in ours:
+        return 75.0, False   # stay outside their 45 m arc
+    if "laser" in ours and "mortar" in theirs:
+        return 120.0, False  # laser outranges the shell, and cook-off adds +60%
+    if "lightning" in ours and "laser" not in ours:
+        return 26.0, True
+    return default, False
 
 # Feature switches (set to False to turn a behavior off).
 PEEK_FIGHT = False     # duck behind cover while the laser cools down, charge there, peek out to fire
@@ -33,7 +55,8 @@ NPC_FARM = True       # early on, go to drones (2 cubes each) and shoot crates (
 NPC_FARM_UNTIL = 120.0  # seconds of match time to farm
 FLEE_COUNT = 3         # retreat when this many mechs are within 100 m
 FIGHT_RANGE = 70.0     # preferred distance to the target with a laser or gun
-STYLE = "brawler"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far)
+STYLE = "adaptive"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far),
+                       # "adaptive" (range and loot chosen from our and the enemy's weapons)
 UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
 
@@ -134,6 +157,8 @@ class Bot:
         self.dmg_bearing = None
         self.recover = False  # low HP: break contact and regenerate before fighting again
         self.seen_pickups = {}  # id -> (kind, pos) of weapons seen on the ground
+        self.enemy_seen = {}    # weapon kind -> number of distinct enemy mechs seen carrying it
+        self.enemy_seen_ids = set()
         self.cover = None       # cached cover point [x, y] against the current target
         self.cover_t = -99.0
         self.cover_tid = None
@@ -300,7 +325,12 @@ class Bot:
         # pickups
         reach = self.cfg["loot"]["pickup_radius"] - 0.6
         near_pick = [p for p in obs["pickups"] if math.hypot(p["pos"][0] - x, p["pos"][1] - y) < reach and abs(p["pos"][2] - z) < 3.5]
-        rank = wrank()
+        for m in mechs:
+            for wkind in m.get("weapons") or []:
+                if (m["id"], wkind) not in self.enemy_seen_ids:
+                    self.enemy_seen_ids.add((m["id"], wkind))
+                    self.enemy_seen[wkind] = self.enemy_seen.get(wkind, 0) + 1
+        rank = wrank(self.enemy_seen)
         for p in sorted(near_pick, key=lambda p: -rank.get(p["kind"], 0)):
             if p["kind"] not in rank or p["kind"] in wk:
                 continue
@@ -310,8 +340,8 @@ class Bot:
             if wk[0] is None:
                 act["take"] = p["id"]
                 break
-            if STYLE == "brawler" and "gun" in wk:
-                # Brawler: swap the gun out for laser/lightning.
+            if STYLE in ("brawler", "adaptive") and "gun" in wk:
+                # Swap the gun out to carry laser + lightning.
                 act["take"] = p["id"]
                 act["drop"] = wk.index("gun")
                 break
@@ -463,6 +493,12 @@ class Bot:
                 desired = 26.0
             if STYLE == "sniper" and target["kind"] == "mech":
                 desired = 160.0
+            close_fast = False
+            if STYLE == "adaptive" and target["kind"] == "mech":
+                theirs = set(target.get("weapons") or [])
+                desired, close_fast = matchup_range(set(k for k in wk if k), theirs, FIGHT_RANGE)
+                if "lightning" in theirs and "lightning" not in wk and ed < 48 and me["energy"] > 20:
+                    boost = True  # get out of their arc range fast
             radial = max(-1.0, min(1.0, (ed - desired) / 40.0))
             if flee:
                 mode = "flee"
@@ -476,8 +512,8 @@ class Bot:
                 zx, zy = toward(zc[0], zc[1], edge_pressure * 1.5)
                 mx += zx
                 my += zy
-                if (STYLE == "brawler" and target["kind"] == "mech" and slot("lightning") is not None
-                        and ed > 45 and me["energy"] > 50 and hp_frac > 0.5):
+                if (((STYLE == "brawler" and slot("lightning") is not None) or close_fast)
+                        and target["kind"] == "mech" and ed > 45 and me["energy"] > 50 and hp_frac > 0.5):
                     boost = True  # close the gap into lightning range quickly
                 # Peek fighting against a lone mech: hide while the laser cools down and charges,
                 # then step out with a full charge and fire. Not at lightning range (brawl there).
@@ -543,7 +579,7 @@ class Bot:
                 # Early on, with no laser or lightning yet, a far weapon is worth the walk.
                 unarmed = not any(k in rank for k in wk)
                 loot_range = 250 if (EARLY_LOOT and unarmed and t < 100) else 90
-                want_slot = wk[1] is None or wk[0] is None or (STYLE == "brawler" and "gun" in wk)
+                want_slot = wk[1] is None or wk[0] is None or (STYLE in ("brawler", "adaptive") and "gun" in wk)
                 if pk and want_slot and not self.recover:
                     p = min(pk, key=lambda p: d2(p["pos"]))
                     if d2(p["pos"]) < loot_range:
