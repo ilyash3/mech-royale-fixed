@@ -55,8 +55,9 @@ NPC_FARM = True       # early on, go to drones (2 cubes each) and shoot crates (
 NPC_FARM_UNTIL = 120.0  # seconds of match time to farm
 FLEE_COUNT = 3         # retreat when this many mechs are within 100 m
 FIGHT_RANGE = 70.0     # preferred distance to the target with a laser or gun
-STYLE = "adaptive"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far),
+STYLE = "default"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far),
                        # "adaptive" (range and loot chosen from our and the enemy's weapons)
+LASER_DODGE = True    # sidestep when a visible enemy is charging a laser aimed at us
 UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
 
@@ -651,6 +652,29 @@ class Bot:
                     my += (vx / vs) * s * 1.4
                     if mode == "idle":
                         mode = "dodge"
+
+        # sidestep laser charges aimed at us (the beam is instant once released, so move during the charge)
+        if LASER_DODGE:
+            my_r = 2.5 * scale
+            for m in mechs:
+                if not m.get("charging"):
+                    continue
+                sx_, sy_ = m["pos"][0], m["pos"][1]
+                dd = math.hypot(x - sx_, y - sy_)
+                if dd > 285 or dd < 1:
+                    continue
+                err = wrap(math.atan2(y - sy_, x - sx_) - m["aim"][0])
+                if abs(err) > 0.5:
+                    continue
+                lateral = dd * math.sin(err)  # signed miss distance of their current aim line
+                if abs(lateral) < my_r + 4.0:
+                    ux, uy = (x - sx_) / dd, (y - sy_) / dd   # along their aim, toward us
+                    side = 1.0 if lateral >= 0 else -1.0       # step to the side we are already on
+                    px2, py2 = -uy * side, ux * side
+                    mx, my = px2 * 1.6 + mx * 0.3, py2 * 1.6 + my * 0.3
+                    boost = me["energy"] > 12
+                    mode = "laser-dodge"
+                    break
 
         # stuck / escape
         moving_cmd = math.hypot(mx, my)
