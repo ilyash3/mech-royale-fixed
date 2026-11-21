@@ -58,13 +58,14 @@ HUNT = False           # when healthy, walk toward visible mechs (up to 230 m) a
 HUNT_HP = 0.7          # only hunt above this HP fraction
 NPC_FARM = True       # early on, go to drones (2 cubes each) and shoot crates (1 cube, maybe a weapon)
 NPC_FARM_UNTIL = 120.0  # seconds of match time to farm
-FLEE_COUNT = 2         # retreat when this many mechs are within 100 m
+FLEE_COUNT = 3         # retreat when this many mechs are within 100 m
 FIGHT_RANGE = 70.0     # preferred distance to the target with a laser or gun
 STYLE = "default"      # "default", "brawler" (lightning + laser, drop the gun, fight close), "sniper" (fight far),
                        # "adaptive" (range and loot chosen from our and the enemy's weapons)
-NAV = True             # plan routes around buildings (A* on a 4 m grid) for zone, loot, drops, hunting
+NAV = False             # plan routes around buildings (A* on a 4 m grid) for zone, loot, drops, hunting
 LASER_DODGE = True    # sidestep when a visible enemy is charging a laser aimed at us
-LASER_COVER = True    # instead of sidestepping, run behind the nearest wall (within 16 m) to break its line of sight
+LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (within 16 m) to break its line of sight
+FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
 UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
 
@@ -170,6 +171,8 @@ class Bot:
         self.dmg_t = -99.0
         self.dmg_bearing = None
         self.recover = False  # low HP: break contact and regenerate before fighting again
+        self.focus_id = None    # the enemy mech we are trying to finish
+        self.focus_last = None  # (pos, t, hp_frac) where we last knew it
         self.seen_pickups = {}  # id -> (kind, pos) of weapons seen on the ground
         self.enemy_seen = {}    # weapon kind -> number of distinct enemy mechs seen carrying it
         self.enemy_seen_ids = set()
@@ -288,6 +291,10 @@ class Bot:
             act["pick"] = pick
 
         for ev in obs.get("events", []):
+            if ev.get("type") == "hit" and isinstance(ev.get("target"), int) and ev["target"] < 16:
+                self.focus_id = ev["target"]
+            if ev.get("type") == "kill" and ev.get("target") == self.focus_id:
+                self.focus_id, self.focus_last = None, None
             if ev.get("type") == "damaged" and ev.get("weapon") != "zone" and ev.get("bearing") is not None:
                 self.dmg_t = t
                 self.dmg_bearing = ev["bearing"]
@@ -371,6 +378,15 @@ class Bot:
         aim = None
         if mechs:
             target = mechs[0]
+            if FINISH_KILL:
+                def tscore(m):
+                    hpf = m.get("hp", 1400) / max(1.0, m.get("max_hp", 1400))
+                    return d2(m["pos"]) - 120.0 * (1.0 - hpf) - (60.0 if m["id"] == self.focus_id else 0.0)
+                target = min(mechs, key=tscore)
+        if FINISH_KILL and self.focus_id is not None:
+            for m in mechs:
+                if m["id"] == self.focus_id:
+                    self.focus_last = (m["pos"], obs["t"], m.get("hp", 1400) / max(1.0, m.get("max_hp", 1400)))
         if target is None and npcs and hp_frac > 0.6:
             n0 = min(npcs, key=lambda m: d2(m["pos"]))
             if d2(n0["pos"]) < 70:
@@ -466,6 +482,10 @@ class Bot:
         # reload when calm
         if not close and g_ammo_low(me):
             act["reload"] = True
+        # An empty gun must be reloaded explicitly: never sit in a fight with 0 rounds.
+        for w in me["weapons"]:
+            if w and w["kind"] == "gun" and w.get("ammo", 1) <= 0 and w.get("reload", 0) <= 0:
+                act["reload"] = True
 
         # ---------------- movement
         mx, my = 0.0, 0.0
@@ -528,6 +548,13 @@ class Bot:
                 zx, zy = toward(zc[0], zc[1], edge_pressure * 1.5)
                 mx += zx
                 my += zy
+                if (FINISH_KILL and target["kind"] == "mech" and not visible_los and not self.recover
+                        and n_threat <= 1):
+                    thpf = target.get("hp", 1400) / max(1.0, target.get("max_hp", 1400))
+                    if thpf < 0.6 and hp_frac > thpf + 0.1:
+                        mode = "chase"  # it ducked behind cover hurt: follow before it heals
+                        nav_goal = target["pos"]
+                        mx, my = toward(target["pos"][0], target["pos"][1])
                 if (((STYLE == "brawler" and slot("lightning") is not None) or close_fast)
                         and target["kind"] == "mech" and ed > 45 and me["energy"] > 50 and hp_frac > 0.5):
                     boost = True  # close the gap into lightning range quickly
@@ -569,7 +596,16 @@ class Bot:
         else:
             # not fighting: loot, drops, zone positioning
             goal = None
-            if DROPS_ANY_HP:
+            if FINISH_KILL and self.focus_last is not None and not self.recover:
+                fpos, ft, fhp = self.focus_last
+                if (t - ft < 8.0 and fhp < 0.6 and hp_frac > fhp + 0.1 and len(close) <= 1
+                        and math.hypot(fpos[0] - zc[0], fpos[1] - zc[1]) < zr - 10
+                        and math.hypot(fpos[0] - x, fpos[1] - y) > 4):
+                    goal = fpos
+                    mode = "chase"
+                elif t - ft >= 8.0:
+                    self.focus_last = None
+            if goal is None and DROPS_ANY_HP:
                 # Uncontested supply drop: 3 cubes + full HP + full energy. Checked before loot.
                 for dr in obs["drops"]:
                     dd = d2(dr["pos"])
