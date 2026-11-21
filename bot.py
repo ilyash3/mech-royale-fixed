@@ -13,6 +13,12 @@ PICK_PRIORITY = ["plating", "armor", "nanites", "gun_damage", "gun_rate", "laser
 # Mortar is never taken: holding one makes enemy laser hits do +60% (cook-off).
 WEAPON_RANK = {"laser": 3, "lightning": 2}
 
+# Feature switches (set to False to turn a behavior off).
+PEEK_FIGHT = True      # duck behind cover while the laser cools down, charge there, peek out to fire
+EARLY_LOOT = True      # remember seen weapons; go far for a laser/lightning in the first 100 s
+LETHAL_RELEASE = True  # fire a partly charged laser when it already kills the target
+DROPS_ANY_HP = True    # go for uncontested supply drops from farther away, before loot and cubes
+
 
 def wrap(a):
     return (a + math.pi) % TAU - math.pi
@@ -110,6 +116,10 @@ class Bot:
         self.dmg_t = -99.0
         self.dmg_bearing = None
         self.recover = False  # low HP: break contact and regenerate before fighting again
+        self.seen_pickups = {}  # id -> (kind, pos) of weapons seen on the ground
+        self.cover = None       # cached cover point [x, y] against the current target
+        self.cover_t = -99.0
+        self.cover_tid = None
 
     # ---------------------------------------------------------------- helpers
     def zone_now(self, z, t):
@@ -177,6 +187,30 @@ class Bot:
                 bestk, bestfr = k, fr
         return want + bestk * 0.35
 
+    def find_cover(self, x, y, z, tx, ty, tid, t, zc, zr):
+        """A nearby reachable point, inside the zone, with no line of sight to (tx, ty). Cached 0.6 s."""
+        if tid == self.cover_tid and t - self.cover_t < 0.6:
+            return self.cover
+        best, best_s = None, 1e9
+        away = math.atan2(y - ty, x - tx)
+        for k in range(12):
+            a = k * TAU / 12
+            for dist in (7.0, 13.0, 20.0):
+                cx, cy = x + math.cos(a) * dist, y + math.sin(a) * dist
+                if math.hypot(cx - zc[0], cy - zc[1]) > zr - 8:
+                    continue
+                if self.world.free(x, y, a, dist + 3) < dist + 2.5:
+                    continue  # path to it is blocked
+                if self.world.los(cx, cy, tx, ty, z):
+                    continue  # still exposed there
+                # Prefer short moves that do not walk toward the enemy.
+                s = dist + 6.0 * abs(wrap(a - away))
+                if s < best_s:
+                    best, best_s = [cx, cy], s
+                break  # nearest blocked distance on this heading is enough
+        self.cover, self.cover_t, self.cover_tid = best, t, tid
+        return best
+
     # ---------------------------------------------------------------- main
     def act(self, obs):
         me = obs["self"]
@@ -233,6 +267,18 @@ class Bot:
         def slot(kind):
             return wk.index(kind) if kind in wk else None
 
+        # remember weapons on the ground; forget ones that are gone when we are close enough to see
+        cur_ids = set()
+        for p in obs["pickups"]:
+            cur_ids.add(p["id"])
+            self.seen_pickups[p["id"]] = (p["kind"], p["pos"])
+        for ev in obs.get("events", []):
+            if ev.get("type") == "took":
+                self.seen_pickups.pop(ev.get("id"), None)
+        for pid, (_, ppos) in list(self.seen_pickups.items()):
+            if pid not in cur_ids and math.hypot(ppos[0] - x, ppos[1] - y) < 25:
+                del self.seen_pickups[pid]
+
         # pickups
         reach = self.cfg["loot"]["pickup_radius"] - 0.6
         near_pick = [p for p in obs["pickups"] if math.hypot(p["pos"][0] - x, p["pos"][1] - y) < reach and abs(p["pos"][2] - z) < 3.5]
@@ -262,6 +308,9 @@ class Bot:
             if d2(n0["pos"]) < 70:
                 target = n0
         tgt_d = None
+        visible_los = False
+        laser_cd = None       # laser cooldown left, if we hold a laser
+        laser_charged = False  # laser fully charged and held
         if target is not None:
             tp = target["pos"]
             ts = 1 + 0.05 * target.get("cubes", 0) if target["kind"] == "mech" else 0.4
@@ -286,21 +335,33 @@ class Bot:
             laser_ready = False
             if lz is not None:
                 w = me["weapons"][lz]
-                laser_ready = charging_laser or (w["cooldown"] <= 0.05 and tgt_d < 230 and visible_los)
+                laser_cd = w["cooldown"]
+                # With PEEK_FIGHT the laser may start charging behind cover (the target's position
+                # is still tracked for memory_s after it leaves view).
+                can_start = w["cooldown"] <= 0.05 and tgt_d < 230 and (
+                    visible_los or (PEEK_FIGHT and target["kind"] == "mech" and tgt_d < 140))
+                laser_ready = charging_laser or can_start
             if laser_ready:
+                lcfg = self.cfg["weapons"]["laser"]
                 aim = [yaw_d, pit_d]  # hitscan: no lead
                 err = abs(wrap(yaw_d - cur_yaw))
                 ch = w.get("charge", 0)
                 # Full charge comes from this weapon's stats (after laser_charge upgrades), not the
                 # base config. obs rounds charge to 0.01, so allow a small margin below full.
-                full_charge = w.get("stats", {}).get("charge", self.cfg["weapons"]["laser"]["charge"])
-                full = max(self.cfg["weapons"]["laser"].get("min_charge", 0.15), full_charge - 0.015)
-                if ch >= full and err < tol * 1.3:
-                    fire[lz] = False  # release
-                elif ch > 0.3 and err > 0.25:
-                    fire[lz] = False
+                full_charge = w.get("stats", {}).get("charge", lcfg["charge"])
+                full = max(lcfg.get("min_charge", 0.15), full_charge - 0.015)
+                laser_charged = ch >= full
+                lethal = False
+                if LETHAL_RELEASE and ch >= lcfg.get("min_charge", 0.15) and target.get("hp") is not None:
+                    mfrac = lcfg.get("min_frac", 0.35)
+                    frac = mfrac + (1 - mfrac) * min(1.0, ch / max(1e-3, full_charge))
+                    # Conservative: assume the target has the maximum armor (3 x 8%).
+                    est = w.get("stats", {}).get("damage", lcfg["damage"]) * frac * 0.76
+                    lethal = est >= target["hp"] + 25
+                if visible_los and err < tol * 1.3 and (laser_charged or lethal):
+                    fire[lz] = False  # release: the beam fires now
                 else:
-                    fire[lz] = True
+                    fire[lz] = True   # keep charging / holding (auto-fires after hold_s)
                 # The gun keeps firing during the charge, but only if the unled aim is on target.
                 err_l = err
             if g is not None:
@@ -379,6 +440,28 @@ class Bot:
                 zx, zy = toward(zc[0], zc[1], edge_pressure * 1.5)
                 mx += zx
                 my += zy
+                # Peek fighting against a lone mech: hide while the laser cools down and charges,
+                # then step out with a full charge and fire. Not at lightning range (brawl there).
+                lightning_brawl = slot("lightning") is not None and ed < 42
+                if (PEEK_FIGHT and laser_cd is not None and target["kind"] == "mech"
+                        and n_threat <= 1 and ed > 20 and not lightning_brawl):
+                    charging_now = me["weapons"][slot("laser")].get("charge", 0) > 0
+                    if laser_charged and not visible_los:
+                        mode = "peek"  # step back out toward the target to get the shot
+                        mx, my = rx, ry
+                    elif (laser_cd > 0.3 or (charging_now and not laser_charged)) and not visible_los:
+                        mode = "cover"  # already out of its sight: hold still (silent)
+                        mx = my = 0.0
+                    elif laser_cd > 0.3 or (charging_now and not laser_charged):
+                        cov = self.find_cover(x, y, z, target["pos"][0], target["pos"][1],
+                                              target["id"], t, zc, zr)
+                        if cov is not None:
+                            mode = "cover"
+                            dcov = math.hypot(cov[0] - x, cov[1] - y)
+                            if dcov > 1.5:
+                                mx, my = toward(cov[0], cov[1])
+                            else:
+                                mx = my = 0.0
         elif self.dmg_bearing is not None and t - self.dmg_t < 3.0 and not (target is not None and tgt_d is not None and tgt_d < 140):
             # Shot by something we cannot see: do not stand still. Run away from the shot's
             # origin with a sideways wobble, biased toward the zone.
@@ -395,19 +478,43 @@ class Bot:
         else:
             # not fighting: loot, drops, zone positioning
             goal = None
-            pk = [p for p in obs["pickups"] if p["kind"] in WEAPON_RANK and p["kind"] not in wk
-                  and math.hypot(p["pos"][0] - zc[0], p["pos"][1] - zc[1]) < zr - 15]
-            if pk and (wk[1] is None or wk[0] is None) and not self.recover:
-                p = min(pk, key=lambda p: d2(p["pos"]))
-                if d2(p["pos"]) < 90:
-                    goal = p["pos"]
-                    mode = "loot"
-            if goal is None:
+            if DROPS_ANY_HP:
+                # Uncontested supply drop: 3 cubes + full HP + full energy. Checked before loot.
+                for dr in obs["drops"]:
+                    dd = d2(dr["pos"])
+                    contested = any(math.hypot(m["pos"][0] - dr["pos"][0], m["pos"][1] - dr["pos"][1]) < 50
+                                    for m in mechs)
+                    if (dd < 350 and not contested and dr["lands_in"] * 11 < dd + 40
+                            and dr["holder"] in (None, me["id"])
+                            and math.hypot(dr["pos"][0] - zc[0], dr["pos"][1] - zc[1]) < zr - 10):
+                        goal = dr["pos"]
+                        mode = "drop"
+                        if dd < dr["radius"] * 0.5 and dr["lands_in"] <= 0:
+                            goal = None
+                            mode = "hold-drop"
+                            mx = my = 0.0
+                        break
+            if goal is None and mode != "hold-drop":
+                if EARLY_LOOT:
+                    pk = [{"kind": k, "pos": pp} for k, pp in self.seen_pickups.values()]
+                else:
+                    pk = obs["pickups"]
+                pk = [p for p in pk if p["kind"] in WEAPON_RANK and p["kind"] not in wk
+                      and math.hypot(p["pos"][0] - zc[0], p["pos"][1] - zc[1]) < zr - 15]
+                # Early on, with no laser or lightning yet, a far weapon is worth the walk.
+                unarmed = not any(k in WEAPON_RANK for k in wk)
+                loot_range = 250 if (EARLY_LOOT and unarmed and t < 100) else 90
+                if pk and (wk[1] is None or wk[0] is None) and not self.recover:
+                    p = min(pk, key=lambda p: d2(p["pos"]))
+                    if d2(p["pos"]) < loot_range:
+                        goal = p["pos"]
+                        mode = "loot"
+            if goal is None and mode != "hold-drop":
                 cu = [c for c in obs["cubes"] if d2(c["pos"]) < 45 and math.hypot(c["pos"][0] - zc[0], c["pos"][1] - zc[1]) < zr - 12]
                 if cu and not self.recover:
                     goal = min(cu, key=lambda c: d2(c["pos"]))["pos"]
                     mode = "cube"
-            if goal is None:
+            if goal is None and not DROPS_ANY_HP:  # original drop logic, used when the switch is off
                 for dr in obs["drops"]:
                     dd = d2(dr["pos"])
                     if dd < 140 and dr["lands_in"] * 11 < dd + 40 and dr["holder"] in (None, me["id"]):
