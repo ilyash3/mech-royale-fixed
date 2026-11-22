@@ -81,7 +81,8 @@ LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (w
 FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
 ARM_FIRST = False      # gun only and not being hit: keep heading for a laser/lightning (up to 300 m) instead of strafing
 RELOCATE = False       # after a kill, move about 60 m away from the fight spot for 8 s
-LOS_BLOCK_TOP = 6.0    # a building blocks our line of sight only if its top is this far above our feet (muzzle ~7 m)
+HOLD_FIRE_HEALING = False  # below RECOVER_HP, hold fire (to let regen start) unless being hit or enemy within 40 m
+LOS_BLOCK_TOP = 3.0    # a building blocks our line of sight only if its top is this far above our feet (muzzle ~7 m)
 GUN_TOL_MULT = 3.0     # multiply the aim tolerance for firing (higher = shoot more freely)
 CANARY_NO_MECH_FIRE = False  # DIAGNOSTIC: never fire at enemy mechs (drones/crates still shot)
 RECOVER_HP = 0.33      # retreat and heal below this HP fraction (0 = never)
@@ -537,7 +538,7 @@ class Bot:
             # While recovering, any damage we deal restarts the 5 s regen timer: hold fire unless
             # we are being shot right now or the enemy is on top of us. A laser already charging
             # keeps its trigger state (letting go would fire it anyway).
-            if self.recover and not (t - self.dmg_t < 2.0 or tgt_d < 40) and not stay_fight:
+            if HOLD_FIRE_HEALING and self.recover and not (t - self.dmg_t < 2.0 or tgt_d < 40) and not stay_fight:
                 for i, k in enumerate(wk):
                     if k == "laser" and charging_laser:
                         continue
