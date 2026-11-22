@@ -81,7 +81,8 @@ LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (w
 FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
 ARM_FIRST = False      # gun only and not being hit: keep heading for a laser/lightning (up to 300 m) instead of strafing
 RELOCATE = False       # after a kill, move about 60 m away from the fight spot for 8 s
-GUN_TOL_MULT = 3.0     # multiply the aim tolerance for firing (higher = shoot more freely)
+LOS_BLOCK_TOP = 3.0    # a building blocks our line of sight only if its top is this far above our feet (muzzle ~7 m)
+GUN_TOL_MULT = 4.0     # multiply the aim tolerance for firing (higher = shoot more freely)
 CANARY_NO_MECH_FIRE = False  # DIAGNOSTIC: never fire at enemy mechs (drones/crates still shot)
 RECOVER_HP = 0.33      # retreat and heal below this HP fraction (0 = never)
 RECOVER_EXIT = 0.85    # ...until back above this
@@ -155,7 +156,7 @@ class World:
         ang = math.atan2(ty - y, tx - x)
         dx, dy = math.cos(ang), math.sin(ang)
         for p in self.pr:
-            if p[4] > z + 9 or p[5] < z + 3:
+            if p[4] > z + 9 or p[5] < z + LOS_BLOCK_TOP:
                 continue
             if max(x, tx) < p[0] or min(x, tx) > p[2] or max(y, ty) < p[1] or min(y, ty) > p[3]:
                 continue
