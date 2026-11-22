@@ -81,7 +81,10 @@ LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (w
 FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
 ARM_FIRST = False      # gun only and not being hit: keep heading for a laser/lightning (up to 300 m) instead of strafing
 RELOCATE = False       # after a kill, move about 60 m away from the fight spot for 8 s
-FIGHT_CALC = True     # stay or leave each fight by comparing time-to-kill (ours vs. everyone shooting at us)
+CANARY_NO_MECH_FIRE = True  # DIAGNOSTIC: never fire at enemy mechs (drones/crates still shot)
+RECOVER_HP = 0.33      # retreat and heal below this HP fraction (0 = never)
+RECOVER_EXIT = 0.85    # ...until back above this
+FIGHT_CALC = False     # stay or leave each fight by comparing time-to-kill (ours vs. everyone shooting at us)
 STAY_RATIO = 1.0       # stay while (their time to kill us) / (our time to kill target) >= this
 LEAVE_COVER_DIST = 16.0  # when losing, run to cover only if a wall is this close
 NO_COVER_ACTION = "fight"  # losing with no cover close: "fight" (keep shooting) or "flee" (old retreat)
@@ -349,9 +352,9 @@ class Bot:
         close = [m for m in mechs if d2(m["pos"]) < 110]
 
         # Recovery: enter below 33% HP, leave once regenerated to 85%.
-        if hp_frac < 0.33:
+        if hp_frac < RECOVER_HP:
             self.recover = True
-        elif hp_frac > 0.85:
+        elif hp_frac > RECOVER_EXIT or RECOVER_HP <= 0:
             self.recover = False
 
         zc, zr = self.zone_now(obs["zone"], t)
@@ -536,6 +539,8 @@ class Bot:
                     if k == "laser" and charging_laser:
                         continue
                     fire[i] = False
+            if CANARY_NO_MECH_FIRE and target["kind"] == "mech":
+                fire = [False, False]
             if aim is not None:
                 aim[1] = max(self.cfg["mech"]["min_pitch"], min(self.cfg["mech"]["max_pitch"], aim[1]))
         # reload when calm
