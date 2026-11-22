@@ -37,6 +37,19 @@ def wrank(enemy_seen=None):
     return WEAPON_RANK
 
 
+def weapon_dps(kind, dist):
+    """Rough sustained damage per second of one weapon at a distance (before cubes and armor)."""
+    if kind == "gun":
+        return 100.0 if dist <= 215 else 0.0
+    if kind == "laser":
+        return 130.0 if dist <= 280 else 0.0
+    if kind == "lightning":
+        return 240.0 if dist <= 45 else 0.0
+    if kind == "mortar":
+        return 75.0 if 12 < dist <= 235 else 0.0
+    return 0.0
+
+
 def matchup_range(ours, theirs, default):
     """Preferred distance against one enemy, from the weapon triangle. Returns (range, close_fast)."""
     if "lightning" in ours and "laser" in theirs and "lightning" not in theirs:
@@ -66,6 +79,12 @@ NAV = False             # plan routes around buildings (A* on a 4 m grid) for zo
 LASER_DODGE = True    # sidestep when a visible enemy is charging a laser aimed at us
 LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (within 16 m) to break its line of sight
 FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
+ARM_FIRST = False      # gun only and not being hit: keep heading for a laser/lightning (up to 300 m) instead of strafing
+RELOCATE = False       # after a kill, move about 60 m away from the fight spot for 8 s
+FIGHT_CALC = True     # stay or leave each fight by comparing time-to-kill (ours vs. everyone shooting at us)
+STAY_RATIO = 1.0       # stay while (their time to kill us) / (our time to kill target) >= this
+LEAVE_COVER_DIST = 16.0  # when losing, run to cover only if a wall is this close
+NO_COVER_ACTION = "fight"  # losing with no cover close: "fight" (keep shooting) or "flee" (old retreat)
 UPGRADES = "defense"   # "defense" (plating/armor first) or "offense" (weapon damage and rate first)
 
 
@@ -171,6 +190,8 @@ class Bot:
         self.dmg_t = -99.0
         self.dmg_bearing = None
         self.recover = False  # low HP: break contact and regenerate before fighting again
+        self.reloc = None       # (goal x, goal y, until t): where to move after a kill
+        self.fight_r = None     # FIGHT_CALC: last time-to-kill ratio (their TTK / our TTK)
         self.focus_id = None    # the enemy mech we are trying to finish
         self.focus_last = None  # (pos, t, hp_frac) where we last knew it
         self.seen_pickups = {}  # id -> (kind, pos) of weapons seen on the ground
@@ -293,6 +314,19 @@ class Bot:
         for ev in obs.get("events", []):
             if ev.get("type") == "hit" and isinstance(ev.get("target"), int) and ev["target"] < 16:
                 self.focus_id = ev["target"]
+            if RELOCATE and ev.get("type") == "kill":
+                ax, ay = 0.0, 0.0
+                for m in obs["mechs"]:
+                    if m["kind"] == "mech" and m["id"] != ev.get("target"):
+                        dm = max(1.0, math.hypot(m["pos"][0] - me["pos"][0], m["pos"][1] - me["pos"][1]))
+                        ax -= (m["pos"][0] - me["pos"][0]) / dm
+                        ay -= (m["pos"][1] - me["pos"][1]) / dm
+                zc0 = obs["zone"].get("next_center") or obs["zone"]["center"]
+                dz = max(1.0, math.hypot(zc0[0] - me["pos"][0], zc0[1] - me["pos"][1]))
+                ax += 0.6 * (zc0[0] - me["pos"][0]) / dz
+                ay += 0.6 * (zc0[1] - me["pos"][1]) / dz
+                n = max(1e-6, math.hypot(ax, ay))
+                self.reloc = (me["pos"][0] + 60 * ax / n, me["pos"][1] + 60 * ay / n, obs["t"] + 8.0)
             if ev.get("type") == "kill" and ev.get("target") == self.focus_id:
                 self.focus_id, self.focus_last = None, None
             if ev.get("type") == "damaged" and ev.get("weapon") != "zone" and ev.get("bearing") is not None:
@@ -469,10 +503,35 @@ class Bot:
                     aim = list(ma)
                     if abs(wrap(ma[0] - cur_yaw)) < 0.08 and me["weapons"][mo]["cooldown"] <= 0.05:
                         fire[mo] = True
+            # Fight-or-leave estimate: who kills whom first?
+            self.fight_r = None
+            if FIGHT_CALC and target["kind"] == "mech":
+                cube_k = lambda c: 1.0 + 0.04 * min(c or 0, 10)
+                our = sum(weapon_dps(k, tgt_d) for k in wk if k)
+                if "lightning" in (target.get("weapons") or []) and tgt_d <= 45 and "laser" in wk:
+                    our -= weapon_dps("laser", tgt_d) * 0.6  # their arc keeps shorting our laser
+                our *= cube_k(me.get("cubes")) * (1.0 if visible_los else 0.3)
+                theirs = 0.0
+                for m in mechs[:5]:
+                    dm = d2(m["pos"])
+                    if dm > 235:
+                        continue
+                    if m["id"] != target["id"] and not self.world.los(x, y, m["pos"][0], m["pos"][1], z):
+                        continue
+                    if m["id"] == target["id"] and not visible_los:
+                        continue
+                    md = sum(weapon_dps(k, dm) for k in (m.get("weapons") or ["gun"]))
+                    if "lightning" in wk and dm <= 45 and "laser" in (m.get("weapons") or []):
+                        md -= weapon_dps("laser", dm) * 0.6
+                    theirs += md * cube_k(m.get("cubes"))
+                our_ttk = target.get("hp", 1400) / max(1.0, our)
+                their_ttk = me["hp"] / max(1.0, theirs)
+                self.fight_r = their_ttk / max(0.1, our_ttk)
+            stay_fight = self.fight_r is not None and self.fight_r >= STAY_RATIO
             # While recovering, any damage we deal restarts the 5 s regen timer: hold fire unless
             # we are being shot right now or the enemy is on top of us. A laser already charging
             # keeps its trigger state (letting go would fire it anyway).
-            if self.recover and not (t - self.dmg_t < 2.0 or tgt_d < 40):
+            if self.recover and not (t - self.dmg_t < 2.0 or tgt_d < 40) and not stay_fight:
                 for i, k in enumerate(wk):
                     if k == "laser" and charging_laser:
                         continue
@@ -492,6 +551,12 @@ class Bot:
         boost = False
         mode = "idle"
         nav_goal = None  # long-range destination for route planning
+        arm_goal = None  # ARM_FIRST: weapon to reach before taking fights
+        if ARM_FIRST and not any(k in ("laser", "lightning") for k in wk):
+            cands = [pp for kk, pp in self.seen_pickups.values() if kk in ("laser", "lightning")
+                     and math.hypot(pp[0] - x, pp[1] - y) < 300 and math.hypot(pp[0] - zc[0], pp[1] - zc[1]) < zr - 15]
+            if cands:
+                arm_goal = min(cands, key=lambda pp: math.hypot(pp[0] - x, pp[1] - y))
 
         def toward(px, py, w=1.0):
             a = math.atan2(py - y, px - x)
@@ -509,13 +574,26 @@ class Bot:
             tx_, ty_ = toward(zc[0], zc[1])
             mx, my = tx_, ty_
             boost = me["energy"] > 15
-        elif target is not None and tgt_d is not None and tgt_d < (220 if STYLE == "sniper" else 140):
+        elif target is not None and tgt_d is not None and tgt_d < (220 if STYLE == "sniper" else 140) and not (
+                arm_goal is not None and target["kind"] == "mech" and t - self.dmg_t > 3.0 and tgt_d > 45):
             mode = "fight"
             ex, ey = target["pos"][0] - x, target["pos"][1] - y
             ed = math.hypot(ex, ey) + 1e-6
             rx, ry = ex / ed, ey / ed
             n_threat = len([m for m in close if d2(m["pos"]) < 100])
             flee = (self.recover and ed > 12) or n_threat >= FLEE_COUNT
+            leave_to = None
+            if FIGHT_CALC and self.fight_r is not None:
+                flee = False
+                if self.fight_r < STAY_RATIO:
+                    if not visible_los and t - self.dmg_t > 1.5:
+                        leave_to = "hide"  # out of its sight and not being hit: stay put and heal
+                    else:
+                        cov = self.find_cover(x, y, z, target["pos"][0], target["pos"][1], target["id"], t, zc, zr)
+                        if cov is not None and math.hypot(cov[0] - x, cov[1] - y) <= LEAVE_COVER_DIST:
+                            leave_to = cov
+                        elif NO_COVER_ACTION == "flee":
+                            flee = True
             if t > self.strafe_until:
                 self.strafe = -self.strafe if self.rng.random() < 0.6 else self.strafe
                 self.strafe_until = t + self.rng.uniform(0.7, 1.8)
@@ -536,7 +614,14 @@ class Bot:
                 if "lightning" in theirs and "lightning" not in wk and ed < 48 and me["energy"] > 20:
                     boost = True  # get out of their arc range fast
             radial = max(-1.0, min(1.0, (ed - desired) / 40.0))
-            if flee:
+            if leave_to == "hide":
+                mode = "hide"
+                mx, my = 0.0, 0.0
+            elif leave_to is not None:
+                mode = "break"  # losing: get behind the nearby wall, still shooting on the way
+                mx, my = toward(leave_to[0], leave_to[1])
+                boost = me["energy"] > 15
+            elif flee:
                 mode = "flee"
                 mx, my = -rx * 1.0 + px_ * 0.4, -ry * 1.0 + py_ * 0.4
                 zx, zy = toward(zc[0], zc[1], 0.5)
@@ -596,7 +681,13 @@ class Bot:
         else:
             # not fighting: loot, drops, zone positioning
             goal = None
-            if FINISH_KILL and self.focus_last is not None and not self.recover:
+            if RELOCATE and self.reloc is not None:
+                if t < self.reloc[2] and math.hypot(self.reloc[0] - x, self.reloc[1] - y) > 5:
+                    goal = [self.reloc[0], self.reloc[1]]
+                    mode = "relocate"
+                else:
+                    self.reloc = None
+            if goal is None and FINISH_KILL and self.focus_last is not None and not self.recover:
                 fpos, ft, fhp = self.focus_last
                 if (t - ft < 8.0 and fhp < 0.6 and hp_frac > fhp + 0.1 and len(close) <= 1
                         and math.hypot(fpos[0] - zc[0], fpos[1] - zc[1]) < zr - 10
@@ -631,6 +722,8 @@ class Bot:
                 # Early on, with no laser or lightning yet, a far weapon is worth the walk.
                 unarmed = not any(k in rank for k in wk)
                 loot_range = 250 if (EARLY_LOOT and unarmed and t < 100) else 90
+                if ARM_FIRST and unarmed:
+                    loot_range = 300
                 want_slot = wk[1] is None or wk[0] is None or (STYLE in ("brawler", "adaptive") and "gun" in wk)
                 if pk and want_slot and not self.recover:
                     p = min(pk, key=lambda p: d2(p["pos"]))
@@ -787,7 +880,7 @@ class Bot:
 
         act.update(move=[round(mx, 3), round(my, 3)], boost=boost, jump=jump,
                    aim=[round(wrap(aim[0]), 4), round(aim[1], 4)], fire=fire)
-        mf.draw.label(f"{mode} hp{me['hp']:.0f}")
+        mf.draw.label(f"{mode} hp{me['hp']:.0f}" + (f" R{self.fight_r:.2f}" if self.fight_r is not None else ""))
         return act
 
 
