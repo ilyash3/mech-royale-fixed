@@ -81,7 +81,8 @@ LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (w
 FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
 ARM_FIRST = False      # gun only and not being hit: keep heading for a laser/lightning (up to 300 m) instead of strafing
 RELOCATE = False       # after a kill, move about 60 m away from the fight spot for 8 s
-CANARY_NO_MECH_FIRE = True  # DIAGNOSTIC: never fire at enemy mechs (drones/crates still shot)
+GUN_TOL_MULT = 2.0     # multiply the aim tolerance for firing (higher = shoot more freely)
+CANARY_NO_MECH_FIRE = False  # DIAGNOSTIC: never fire at enemy mechs (drones/crates still shot)
 RECOVER_HP = 0.33      # retreat and heal below this HP fraction (0 = never)
 RECOVER_EXIT = 0.85    # ...until back above this
 FIGHT_CALC = False     # stay or leave each fight by comparing time-to-kill (ours vs. everyone shooting at us)
@@ -455,6 +456,7 @@ class Bot:
             yaw_d, pit_d = self.angles(src, tcenter)
             aim = [yaw_l, pit_l]
             tol = max(0.025, min(0.14, 2.2 / max(5.0, tgt_d)))
+            tol *= GUN_TOL_MULT  # how loose an aim still counts as 'on target'
             cur_yaw, cur_pit = me["aim"]
             err_l = abs(wrap(yaw_l - cur_yaw))
             charging_laser = lz is not None and (me["weapons"][lz].get("charge", 0) > 0)
