@@ -81,12 +81,13 @@ LASER_COVER = False    # instead of sidestepping, run behind the nearest wall (w
 FINISH_KILL = False    # focus the most-damaged enemy and chase a hurt one for a few seconds when it breaks sight
 ARM_FIRST = False      # gun only and not being hit: keep heading for a laser/lightning (up to 300 m) instead of strafing
 RELOCATE = False       # after a kill, move about 60 m away from the fight spot for 8 s
-HOLD_FIRE_HEALING = False  # below RECOVER_HP, hold fire (to let regen start) unless being hit or enemy within 40 m
+HOLD_FIRE_HEALING = True  # below RECOVER_HP, hold fire (to let regen start) unless being hit or enemy within 40 m
 LOS_BLOCK_TOP = 3.0    # a building blocks our line of sight only if its top is this far above our feet (muzzle ~7 m)
+LASER_TOL_MULT = None  # laser release aim tolerance multiplier (None = same as GUN_TOL_MULT)
 GUN_TOL_MULT = 3.0     # multiply the aim tolerance for firing (higher = shoot more freely)
 CANARY_NO_MECH_FIRE = False  # DIAGNOSTIC: never fire at enemy mechs (drones/crates still shot)
-RECOVER_HP = 0.33      # retreat and heal below this HP fraction (0 = never)
-RECOVER_EXIT = 0.85    # ...until back above this
+RECOVER_HP = 0.75      # retreat and heal below this HP fraction (0 = never)
+RECOVER_EXIT = 0.95    # ...until back above this
 FIGHT_CALC = False     # stay or leave each fight by comparing time-to-kill (ours vs. everyone shooting at us)
 STAY_RATIO = 1.0       # stay while (their time to kill us) / (our time to kill target) >= this
 LEAVE_COVER_DIST = 16.0  # when losing, run to cover only if a wall is this close
@@ -458,6 +459,7 @@ class Bot:
             yaw_d, pit_d = self.angles(src, tcenter)
             aim = [yaw_l, pit_l]
             tol = max(0.025, min(0.14, 2.2 / max(5.0, tgt_d)))
+            tol_base = tol
             tol *= GUN_TOL_MULT  # how loose an aim still counts as 'on target'
             cur_yaw, cur_pit = me["aim"]
             err_l = abs(wrap(yaw_l - cur_yaw))
@@ -489,7 +491,8 @@ class Bot:
                     # Conservative: assume the target has the maximum armor (3 x 8%).
                     est = w.get("stats", {}).get("damage", lcfg["damage"]) * frac * 0.76
                     lethal = est >= target["hp"] + 25
-                if visible_los and err < tol * 1.3 and (laser_charged or lethal):
+                laser_tol = tol_base * (GUN_TOL_MULT if LASER_TOL_MULT is None else LASER_TOL_MULT)
+                if visible_los and err < laser_tol * 1.3 and (laser_charged or lethal):
                     fire[lz] = False  # release: the beam fires now
                 else:
                     fire[lz] = True   # keep charging / holding (auto-fires after hold_s)
